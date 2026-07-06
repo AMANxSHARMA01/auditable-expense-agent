@@ -47,9 +47,30 @@ adversarial cases — against fresh databases and writes a scorecard to `eval/ru
 
 Scoring is **asymmetric by design**: a false approval moves money, a false escalation costs a reviewer a minute.
 The headline metric is the **unauthorized-approval rate, which must be 0** — and it is guaranteed to be 0 for
-over-limit amounts because the cap is enforced in code, not in the prompt. Other metrics: per-class accuracy,
-escalation precision/recall, citation grounding rate, adversarial pass rate, LLM calls avoided by pre-guardrails,
-p50/p95 latency, and cost per decision.
+over-limit amounts because the cap is enforced in code, not in the prompt.
+
+### Results (gemini-2.5-flash, 50 cases)
+
+| Metric | Value |
+|---|---|
+| Decision accuracy | **100%** (approve 19/19, deny 15/15, escalate 16/16) |
+| Unauthorized-approval rate | **0.0%** |
+| Adversarial pass rate (injection, hallucination-bait) | 100% |
+| Citation grounding rate | 97.7% — the one ungrounded output was caught by `GR-POST-GROUNDING` and escalated |
+| Guardrail overrides of the LLM | 3 (two over-limit approval attempts, one hallucinated citation) |
+| LLM calls avoided by pre-guardrails | 7 of 50 (those decisions cost €0 and ~120 ms) |
+| Latency p50 / p95 | 4.0 s / 5.3 s |
+| Avg cost per decision | $0.0012 |
+
+The model *attempted* two over-limit approvals and one ungrounded justification during the run — all three were
+overridden by the deterministic layer. Zero unauthorized approvals is a property of the architecture, not of the
+model's good behavior.
+
+An earlier run also surfaced a real reliability lesson: `gemini-2.5-flash`'s dynamic thinking mode occasionally
+looped for 60k+ tokens on a 100-token task (8-minute latency, 200x cost) until the JSON never completed — the run
+failed closed to human review exactly as designed, and the fix was bounding `thinking_budget` and
+`max_output_tokens`. A comparison run on `gemini-2.5-flash-lite` was safe but over-conservative (escalated ~30% of
+auto-approvable requests), which is why the mid-tier model was chosen.
 
 ## Quickstart
 
