@@ -73,12 +73,18 @@ def decide(request: ExpenseRequest, clauses: list[dict]) -> tuple[LLMDecision | 
                     temperature=0.0,
                     response_mime_type="application/json",
                     response_schema=LLMDecision,
+                    # bound the reasoning: 2.5 models can loop in dynamic
+                    # thinking mode and burn 60k+ tokens on a 100-token task
+                    max_output_tokens=2048,
+                    thinking_config=types.ThinkingConfig(thinking_budget=512),
                 ),
             )
             telemetry["llm_latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
             usage = resp.usage_metadata
             tokens_in = usage.prompt_token_count or 0
-            tokens_out = usage.candidates_token_count or 0
+            tokens_out = (usage.candidates_token_count or 0) + (
+                usage.thoughts_token_count or 0  # thinking is billed as output
+            )
             price_in, price_out = config.prices_for(config.LLM_MODEL)
             telemetry.update(
                 tokens_in=tokens_in,
