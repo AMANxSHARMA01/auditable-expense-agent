@@ -20,7 +20,7 @@ from langgraph.types import Command, interrupt
 from pydantic import ValidationError
 
 from . import audit, config, guardrails, llm, retrieval
-from .schemas import ExpenseRequest
+from .schemas import ExpenseRequest, LLMDecision
 
 
 class AgentState(TypedDict, total=False):
@@ -136,24 +136,17 @@ def ai_review(state: AgentState) -> dict:
     retrieved_ids = [c["clause_id"] for c in clauses]
 
     if raw is None:
+        llm_decision = None
         events = []
-        final, decided_by = "escalate", "system:llm_failure"
-        reason_txt = "LLM reasoning step failed schema validation twice; failing closed."
     else:
-        llm_decision = llm.LLMDecision.model_validate(raw)
+        llm_decision = LLMDecision.model_validate(raw)
         events = guardrails.post_check(req, llm_decision, retrieved_ids)
-        final, decided_by = guardrails.resolve_final(llm_decision, events)
-        reason_txt = events[0].detail if events else (
-            llm_decision.justification if final == "escalate" else None
-        )
 
     return {
         "retrieved_clauses": clauses,
         "llm_decision": raw,
         "guardrail_events": prior_events + [e.model_dump() for e in events],
-        "final_decision": final,
-        "decided_by": decided_by,
-        "pending_reason": reason_txt if final == "escalate" else None,
+        **guardrails.apply_post_events(llm_decision, events),
         "telemetry": tel,
     }
 
@@ -223,7 +216,9 @@ def get_graph():
 
 # --- Service layer ---
 
-def submit_expense(request: dict, thread_id: str | None = None) -> dict:
+def submit_expense(
+    request: dict, thread_id: str | None = None, *, include_state: bool = False,
+) -> dict:
     thread_id = thread_id or request.get("request_id") or uuid.uuid4().hex
     run_id = uuid.uuid4().hex
     cfg = {"configurable": {"thread_id": thread_id}}
@@ -235,16 +230,20 @@ def submit_expense(request: dict, thread_id: str | None = None) -> dict:
         reason_txt = result.get("pending_reason") or "Escalated for manual review."
         audit.add_pending(thread_id, run_id, result["request"], reason_txt)
         audit.write_run(_audit_record(result, status="pending_human", total_ms=total_ms))
-        return {"status": "pending_human", "thread_id": thread_id, "run_id": run_id,
-                "reason": reason_txt, "total_ms": total_ms, "state": result}
+        out = {"status": "pending_human", "thread_id": thread_id, "run_id": run_id,
+               "reason": reason_txt, "total_ms": total_ms}
+    else:
+        out = {"status": "completed", "thread_id": thread_id, "run_id": run_id,
+               "final_decision": result.get("final_decision"),
+               "decided_by": result.get("decided_by"), "total_ms": total_ms}
+    if include_state:
+        out["state"] = result
+    return out
 
-    return {"status": "completed", "thread_id": thread_id, "run_id": run_id,
-            "final_decision": result.get("final_decision"),
-            "decided_by": result.get("decided_by"),
-            "total_ms": total_ms, "state": result}
 
-
-def resume_expense(thread_id: str, decision: str, reviewer: str) -> dict:
+def resume_expense(
+    thread_id: str, decision: str, reviewer: str, *, include_state: bool = False,
+) -> dict:
     if decision not in ("approve", "deny"):
         raise ValueError("Human decision must be 'approve' or 'deny'.")
     cfg = {"configurable": {"thread_id": thread_id}}
@@ -252,6 +251,9 @@ def resume_expense(thread_id: str, decision: str, reviewer: str) -> dict:
         Command(resume={"decision": decision, "reviewer": reviewer}), cfg
     )
     audit.resolve_pending(thread_id, decision, reviewer)
-    return {"status": "completed", "thread_id": thread_id,
-            "final_decision": result.get("final_decision"),
-            "decided_by": result.get("decided_by"), "state": result}
+    out = {"status": "completed", "thread_id": thread_id,
+           "final_decision": result.get("final_decision"),
+           "decided_by": result.get("decided_by")}
+    if include_state:
+        out["state"] = result
+    return out

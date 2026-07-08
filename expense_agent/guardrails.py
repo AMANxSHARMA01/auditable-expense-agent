@@ -106,3 +106,24 @@ def resolve_final(
         # any post event forces escalation and names the overriding rule
         return "escalate", f"guardrail:{post_events[0].rule_id}"
     return llm_decision.decision, "llm"
+
+
+def apply_post_events(
+    llm_decision: LLMDecision | None,
+    post_events: list[GuardrailEvent],
+) -> dict:
+    """Map LLM output + post-guardrail events to a terminal graph outcome."""
+    if llm_decision is None:
+        return {
+            "final_decision": "escalate",
+            "decided_by": "system:llm_failure",
+            "pending_reason": "LLM reasoning step failed schema validation twice; failing closed.",
+        }
+    final, decided_by = resolve_final(llm_decision, post_events)
+    reason_txt = post_events[0].detail if post_events else (
+        llm_decision.justification if final == "escalate" else None
+    )
+    out: dict = {"final_decision": final, "decided_by": decided_by}
+    if final == "escalate" and reason_txt:
+        out["pending_reason"] = reason_txt
+    return out

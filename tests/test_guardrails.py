@@ -107,3 +107,18 @@ def test_compliant_approval_stands():
 def test_llm_failure_fails_closed():
     final, decided_by = guardrails.resolve_final(None, [])
     assert (final, decided_by) == ("escalate", "system:llm_failure")
+
+
+def test_apply_post_events_llm_failure():
+    out = guardrails.apply_post_events(None, [])
+    assert out["final_decision"] == "escalate"
+    assert out["decided_by"] == "system:llm_failure"
+    assert "failing closed" in out["pending_reason"]
+
+
+def test_apply_post_events_over_limit():
+    events = guardrails.post_check(req(amount=4200.0), dec(), ["EXP-004"])
+    out = guardrails.apply_post_events(dec(), events)
+    assert out["final_decision"] == "escalate"
+    assert out["decided_by"] == "guardrail:GR-POST-LIMIT"
+    assert "pending_reason" in out

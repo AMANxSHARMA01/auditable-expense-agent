@@ -21,9 +21,7 @@ class HumanDecision(BaseModel):
 
 @app.post("/expenses")
 def create_expense(request: ExpenseRequest):
-    result = submit_expense(request.model_dump(mode="json"))
-    result.pop("state", None)  # full state lives in the audit record
-    return result
+    return submit_expense(request.model_dump(mode="json"))
 
 
 @app.get("/queue")
@@ -40,7 +38,6 @@ def decide(thread_id: str, body: HumanDecision):
         result = resume_expense(thread_id, body.decision, body.reviewer)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
-    result.pop("state", None)
     return result
 
 
