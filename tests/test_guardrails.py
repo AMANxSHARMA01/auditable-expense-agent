@@ -60,6 +60,23 @@ def test_clean_request_passes():
     assert guardrails.pre_check(req(), duplicate_exists=False) == []
 
 
+def test_apply_pre_events_pass_is_empty():
+    assert guardrails.apply_pre_events([]) == {}
+
+
+def test_apply_pre_events_maps_deny_and_escalate():
+    deny = guardrails.pre_check(req(vendor="QuickCash Services"), duplicate_exists=False)
+    assert guardrails.apply_pre_events(deny) == {
+        "final_decision": "deny",
+        "decided_by": "guardrail:GR-PRE-BLACKLIST",
+    }
+    esc = guardrails.pre_check(req(amount=12000.0), duplicate_exists=False)
+    out = guardrails.apply_pre_events(esc)
+    assert out["final_decision"] == "escalate"
+    assert out["decided_by"] == "guardrail:GR-PRE-CEILING"
+    assert "CFO review" in out["pending_reason"]
+
+
 # --- post_check ---
 
 def test_llm_approve_over_limit_is_overridden():

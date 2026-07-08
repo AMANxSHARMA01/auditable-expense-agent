@@ -44,6 +44,23 @@ def pre_check(request: ExpenseRequest, duplicate_exists: bool) -> list[Guardrail
     return events
 
 
+def apply_pre_events(events: list[GuardrailEvent]) -> dict:
+    """Map pre-guardrail events to a terminal graph outcome, or {} to continue."""
+    denies = [e for e in events if e.action == "deny"]
+    if denies:
+        e = denies[0]
+        return {"final_decision": "deny", "decided_by": f"guardrail:{e.rule_id}"}
+    escalates = [e for e in events if e.action == "escalate"]
+    if escalates:
+        e = escalates[0]
+        return {
+            "final_decision": "escalate",
+            "decided_by": f"guardrail:{e.rule_id}",
+            "pending_reason": e.detail,
+        }
+    return {}
+
+
 def post_check(
     request: ExpenseRequest,
     decision: LLMDecision,

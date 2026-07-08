@@ -11,33 +11,27 @@ deterministic code. Even a perfect prompt injection cannot move money.
 
 ## Architecture
 
+Full system design: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+
 ```mermaid
-flowchart TD
-    A[intake_validate<br/>Pydantic schema] --> B[pre_guardrails<br/>vendor blacklist · hard ceiling<br/>duplicate check · receipt rule]
-    B -- "hard deny" --> G[finalize<br/>audit record]
-    B -- "hard escalate" --> F
-    B -- pass --> C[retrieve_policy<br/>top-k clauses + scores]
-    C --> D[llm_reason<br/>structured output: decision,<br/>justification, cited clauses, confidence]
-    D --> E[post_guardrails<br/>auto-approve cap · grounding check<br/>confidence floor — overrides the LLM]
-    E -- escalate --> F[hitl<br/>LangGraph interrupt +<br/>SQLite checkpointer]
-    E -- approve / deny --> G
-    F -- human resumes --> G
+flowchart LR
+    A[Submit] --> B[Validate]
+    B --> C{Hard rules}
+    C -->|deny| F[Done]
+    C -->|escalate| E[Human]
+    C -->|pass| D[AI + policy]
+    D --> G{Safety check}
+    G -->|approve/deny| F
+    G -->|escalate| E
+    E --> F
 ```
 
-- **Deterministic layer** ([guardrails.py](expense_agent/guardrails.py)) — pure functions, unit-tested without any API key.
-  Pre-guardrails short-circuit *before* the LLM (a blacklisted vendor is denied in ~100 ms at zero token cost);
-  post-guardrails override the LLM whenever its output would exceed the authority policy grants an automated system.
-- **Probabilistic layer** ([llm.py](expense_agent/llm.py)) — one temperature-0 Gemini call with a Pydantic
-  `response_schema`, schema-retry, 429 backoff, and a fail-closed fallback (twice-invalid output ⇒ escalate, never a silent default).
-- **Grounding check** — every clause ID the model cites must be in the retrieved set; a justification citing an
-  invented clause is never executed.
-- **Human-in-the-loop** ([graph.py](expense_agent/graph.py)) — escalations park at a LangGraph `interrupt()` backed by a
-  SQLite checkpointer: a durable pause that survives process restarts. A reviewer resumes the run via the API; the
-  decision is attributed (`human:<reviewer>`) in the audit record.
-- **Audit trail** ([audit.py](expense_agent/audit.py)) — one immutable record per run: request, retrieved clauses with
-  scores, full LLM output, every guardrail event, per-node latency, token counts, cost, final decision and decider.
-- **Untrusted input** — the employee's free-text note is delimited and declared as data; adversarial cases
-  (injection, hallucination-bait) are part of the eval set.
+- **Deterministic layer** ([guardrails.py](expense_agent/guardrails.py)) — code enforces policy; runs before and after the LLM.
+- **Probabilistic layer** ([llm.py](expense_agent/llm.py)) — one Gemini call with structured output; fail-closed on errors.
+- **Human-in-the-loop** ([graph.py](expense_agent/graph.py)) — escalations pause until a reviewer decides.
+- **Audit trail** ([audit.py](expense_agent/audit.py)) — one immutable record per run.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for decision criteria and amount bands.
 
 ## Evaluation
 

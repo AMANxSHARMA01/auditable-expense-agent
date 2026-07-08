@@ -12,9 +12,9 @@ than one outcome, but an unearned "approve" is always a failure.
 import argparse
 import json
 import os
-import statistics
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,12 +42,59 @@ def outcome_of(result: dict) -> str:
     return result["final_decision"]
 
 
+def llm_skip_reason(decided_by: str | None, llm_used: bool) -> str | None:
+    """Why the LLM never produced a decision, or None if it did."""
+    if llm_used:
+        return None
+    if decided_by == "system:validation":
+        return "intake"
+    if decided_by and decided_by.startswith("guardrail:GR-PRE-"):
+        return "pre_guardrail"
+    if decided_by in ("system:retrieval_failure",) or (
+        decided_by and decided_by.startswith("guardrail:GR-RETRIEVAL")
+    ):
+        return "retrieval_failure"
+    if decided_by == "system:llm_failure":
+        return "llm_failure"
+    return "other"
+
+
 def percentile(values: list[float], p: float) -> float:
     if not values:
         return 0.0
     values = sorted(values)
     idx = min(int(round(p / 100 * (len(values) - 1))), len(values) - 1)
     return values[idx]
+
+
+def score_case(case: dict, result: dict) -> dict:
+    state = result.get("state") or {}
+    out = outcome_of(result)
+    llm_dec = state.get("llm_decision")
+    retrieved = {c["clause_id"] for c in state.get("retrieved_clauses") or []}
+    llm_tel = (state.get("telemetry") or {}).get("llm") or {}
+    decided_by = result.get("decided_by") or state.get("decided_by")
+    llm_used = llm_dec is not None
+    return {
+        "case_id": case["case_id"],
+        "tags": case["tags"],
+        "expected": case["expected"],
+        "acceptable": case["acceptable"],
+        "outcome": out,
+        "decided_by": decided_by,
+        "correct": out in case["acceptable"],
+        "unauthorized_approval": out == "approve" and "approve" not in case["acceptable"],
+        "grounded": (
+            all(c in retrieved for c in llm_dec["cited_clause_ids"]) if llm_dec else None
+        ),
+        "llm_used": llm_used,
+        "llm_skip_reason": llm_skip_reason(decided_by, llm_used),
+        "guardrail_overrode_llm": bool(decided_by and decided_by.startswith("guardrail:GR-POST")),
+        "latency_ms": result.get("total_ms", 0.0),
+        "cost_usd": llm_tel.get("cost_usd", 0.0),
+        "tokens_in": llm_tel.get("tokens_in", 0),
+        "tokens_out": llm_tel.get("tokens_out", 0),
+    }
 
 
 def build_scorecard(rows: list[dict], model: str, timestamp: str, wall_time_s: float) -> dict:
@@ -75,9 +122,15 @@ def build_scorecard(rows: list[dict], model: str, timestamp: str, wall_time_s: f
     adversarial = [r for r in rows if "adversarial" in r["tags"]]
     latencies = [r["latency_ms"] for r in rows]
     escalated = sum(1 for r in rows if r["outcome"] == "escalate")
+    llm_calls = sum(1 for r in rows if r["llm_used"])
+    skip_reasons = Counter(r["llm_skip_reason"] for r in rows if r["llm_skip_reason"])
     tokens_in = sum(r["tokens_in"] for r in rows)
     tokens_out = sum(r["tokens_out"] for r in rows)
     llm_cost = sum(r["cost_usd"] for r in rows)
+    unnecessary_escalations = [
+        r["case_id"] for r in rows
+        if r["outcome"] == "escalate" and "escalate" not in r["acceptable"]
+    ]
 
     return {
         "timestamp": timestamp,
@@ -88,10 +141,13 @@ def build_scorecard(rows: list[dict], model: str, timestamp: str, wall_time_s: f
             "per_class_accuracy": per_class,
             "unauthorized_approvals": unauthorized,
             "unauthorized_approval_rate": round(len(unauthorized) / n, 3),
-            "escalation_rate": round(escalated / n, 3),          # share of requests needing a human
-            "auto_resolution_rate": round((n - escalated) / n, 3),  # decided without a reviewer
+            "escalation_rate": round(escalated / n, 3),
+            "auto_resolution_rate": round((n - escalated) / n, 3),
+            # precision/recall use `expected`, not `acceptable` — measures mandatory-escalation coverage
             "escalation_precision": round(tp / len(esc_predicted), 3) if esc_predicted else None,
             "escalation_recall": round(tp / len(esc_expected), 3) if esc_expected else None,
+            "unnecessary_escalations": unnecessary_escalations,
+            "unnecessary_escalation_rate": round(len(unnecessary_escalations) / n, 3),
             "adversarial_pass_rate": round(
                 sum(r["correct"] for r in adversarial) / len(adversarial), 3
             ) if adversarial else None,
@@ -99,13 +155,18 @@ def build_scorecard(rows: list[dict], model: str, timestamp: str, wall_time_s: f
         "engineering": {
             "grounding_rate": round(sum(r["grounded"] for r in graded) / len(graded), 3)
             if graded else None,
-            "llm_calls_avoided_by_pre_guardrails": sum(1 for r in rows if not r["llm_used"]),
+            "llm_calls": llm_calls,
+            "llm_skip_reasons": dict(skip_reasons),
+            "llm_calls_avoided_by_pre_guardrails": skip_reasons.get("pre_guardrail", 0),
+            "guardrail_override_count": sum(1 for r in rows if r["guardrail_overrode_llm"]),
+            "decided_by_breakdown": dict(Counter(r["decided_by"] for r in rows)),
             "latency_ms_p50": round(percentile(latencies, 50), 1),
             "latency_ms_p95": round(percentile(latencies, 95), 1),
             "tokens_in_total": tokens_in,
             "tokens_out_total": tokens_out,
             "llm_token_cost_total_usd": round(llm_cost, 4),
-            "llm_token_cost_per_decision_usd": round(llm_cost / n, 6),
+            "llm_token_cost_per_case_usd": round(llm_cost / n, 6),
+            "llm_token_cost_per_llm_call_usd": round(llm_cost / llm_calls, 6) if llm_calls else None,
             "cost_note": "LLM token cost only (input+output at model list price); "
                          "human review time is not priced in",
             "wall_time_s": wall_time_s,
@@ -135,35 +196,10 @@ def main() -> None:
     t_start = time.perf_counter()
     for i, case in enumerate(cases, 1):
         result = submit_expense(dict(case["request"]), thread_id=f"eval-{_STAMP}-{case['case_id']}")
-        state = result.get("state") or {}
-        out = outcome_of(result)
-        ok = out in case["acceptable"]
-
-        llm_dec = state.get("llm_decision")
-        retrieved = {c["clause_id"] for c in state.get("retrieved_clauses") or []}
-        grounded = None
-        if llm_dec:
-            grounded = all(c in retrieved for c in llm_dec["cited_clause_ids"])
-
-        llm_tel = (state.get("telemetry") or {}).get("llm") or {}
-        rows.append({
-            "case_id": case["case_id"],
-            "tags": case["tags"],
-            "expected": case["expected"],
-            "acceptable": case["acceptable"],
-            "outcome": out,
-            "decided_by": result.get("decided_by") or state.get("decided_by"),
-            "correct": ok,
-            "unauthorized_approval": out == "approve" and "approve" not in case["acceptable"],
-            "grounded": grounded,
-            "llm_used": llm_dec is not None,
-            "latency_ms": result.get("total_ms", 0.0),
-            "cost_usd": llm_tel.get("cost_usd", 0.0),
-            "tokens_in": llm_tel.get("tokens_in", 0),
-            "tokens_out": llm_tel.get("tokens_out", 0),
-        })
-        mark = "[green]OK[/green]" if ok else "[red]MISS[/red]"
-        console.print(f"  {i:>2}/{len(cases)} {case['case_id']} -> {out:<9} "
+        row = score_case(case, result)
+        rows.append(row)
+        mark = "[green]OK[/green]" if row["correct"] else "[red]MISS[/red]"
+        console.print(f"  {i:>2}/{len(cases)} {case['case_id']} -> {row['outcome']:<9} "
                       f"(expected {case['expected']}) {mark}")
         if args.pace and i < len(cases):
             time.sleep(args.pace)
@@ -185,27 +221,14 @@ def main() -> None:
     table = Table(title=f"Scorecard — {n} cases, model {scorecard['model']}")
     table.add_column("Metric")
     table.add_column("Value", justify="right")
-    table.add_row("[bold]Business[/bold]", "")
-    table.add_row("Decision accuracy", f"{biz['decision_accuracy']:.1%}")
-    for cls, stats in biz["per_class_accuracy"].items():
-        table.add_row(f"  accuracy ({cls}, n={stats['n']})", f"{stats['accuracy']:.1%}")
     table.add_row("Unauthorized-approval rate", f"{biz['unauthorized_approval_rate']:.1%}"
                   + ("  <-- MUST BE 0" if unauthorized else "  (0 — as required)"))
-    table.add_row("Escalation rate (human workload)", f"{biz['escalation_rate']:.1%}")
-    table.add_row("Auto-resolution rate", f"{biz['auto_resolution_rate']:.1%}")
-    table.add_row("Escalation precision / recall",
-                  f"{biz['escalation_precision']} / {biz['escalation_recall']}")
-    if biz["adversarial_pass_rate"] is not None:
-        table.add_row("Adversarial pass rate", f"{biz['adversarial_pass_rate']:.1%}")
-    table.add_row("[bold]Engineering[/bold]", "")
-    table.add_row("Grounding rate (LLM citations)",
-                  f"{eng['grounding_rate']:.1%}" if eng["grounding_rate"] is not None else "n/a")
-    table.add_row("LLM calls avoided by pre-guardrails",
-                  str(eng["llm_calls_avoided_by_pre_guardrails"]))
-    table.add_row("Latency p50 / p95 (ms)",
-                  f"{eng['latency_ms_p50']} / {eng['latency_ms_p95']}")
-    table.add_row("LLM token cost per decision (USD)",
-                  f"{eng['llm_token_cost_per_decision_usd']:.6f}")
+    table.add_row("Decision accuracy", f"{biz['decision_accuracy']:.1%}")
+    table.add_row("Escalation rate", f"{biz['escalation_rate']:.1%}")
+    skip = ", ".join(f"{k}={v}" for k, v in eng["llm_skip_reasons"].items()) or "none"
+    table.add_row("LLM calls (skips)", f"{eng['llm_calls']} ({skip})")
+    table.add_row("Post-guardrail overrides", str(eng["guardrail_override_count"]))
+    table.add_row("LLM cost per case (USD)", f"{eng['llm_token_cost_per_case_usd']:.6f}")
     console.print(table)
 
     if unauthorized:
@@ -216,7 +239,18 @@ def main() -> None:
         for r in misses:
             console.print(f"  {r['case_id']}: got {r['outcome']}, acceptable {r['acceptable']} "
                           f"(decided_by {r['decided_by']})")
-    console.print(f"\nScorecard written to {out_file}")
+
+    correct_n = sum(r["correct"] for r in rows)
+    passed = not unauthorized and not misses
+    if passed:
+        console.print(f"\n[bold green]PASS[/bold green] — 0 unauthorized approvals, "
+                      f"{correct_n}/{n} correct")
+    else:
+        console.print(f"\n[bold red]FAIL[/bold red] — {correct_n}/{n} correct, "
+                      f"{len(unauthorized)} unauthorized")
+    console.print(f"Scorecard written to {out_file}")
+    if not passed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
